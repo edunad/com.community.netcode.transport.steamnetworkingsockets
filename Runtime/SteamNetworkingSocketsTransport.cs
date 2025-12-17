@@ -91,7 +91,6 @@ namespace Netcode.Transports
 
             if (!this.connectionMapping.ContainsKey(clientId))
             {
-                if (NetworkManager.Singleton?.LogLevel <= LogLevel.Error) NetworkLog.LogErrorServer(nameof(SteamNetworkingSocketsTransport) + " - Can't disconnect client, client not connected, clientId: " + clientId);
                 this.pendingDisconnectReasons.Remove(clientId);
                 return;
             }
@@ -214,7 +213,6 @@ namespace Netcode.Transports
                     payload = new ArraySegment<byte>();
                     receiveTime = Time.realtimeSinceStartup;
 
-                    this.connectionMapping.Remove(clientId);
                     return NetworkEvent.Disconnect;
                 }
 
