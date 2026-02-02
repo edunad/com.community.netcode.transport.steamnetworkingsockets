@@ -360,12 +360,6 @@ namespace Netcode.Transports
 
             try
             {
-                #if UNITY_SERVER
-                SteamGameServerNetworkingUtils.InitRelayNetworkAccess();
-                #else
-                SteamNetworkingUtils.InitRelayNetworkAccess();
-                #endif
-
                 SteamNetworkingIdentity smi = new SteamNetworkingIdentity();
                 smi.SetSteamID(this.client.id);
 
