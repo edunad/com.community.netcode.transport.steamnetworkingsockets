@@ -35,7 +35,12 @@ namespace Netcode.Transports
         private readonly Dictionary<ulong, SteamConnectionData> connectionMapping = new Dictionary<ulong, SteamConnectionData>();
         private readonly Queue<SteamNetConnectionStatusChangedCallback_t> connectionStatusChangeQueue = new Queue<SteamNetConnectionStatusChangedCallback_t>();
         private readonly Dictionary<ulong, string> pendingDisconnectReasons = new Dictionary<ulong, string>();
-        private bool isServer;
+        
+		private bool isServer;
+
+        private int pollStartIndex;
+        private readonly List<ulong> pollKeyCache = new List<ulong>();
+        private bool pollKeyCacheDirty = true;
 
         #endregion
 
@@ -81,6 +86,7 @@ namespace Netcode.Transports
                 #endif
 
                 this.connectionMapping.Remove(this.client.id.m_SteamID);
+                this.pollKeyCacheDirty = true;
             }
 
             this.client = null;
@@ -105,6 +111,7 @@ namespace Netcode.Transports
             #endif
 
             this.connectionMapping.Remove(clientId);
+            this.pollKeyCacheDirty = true;
         }
 
         public override ulong GetCurrentRtt(ulong clientId) {
@@ -167,6 +174,7 @@ namespace Netcode.Transports
                                 };
 
                                 this.connectionMapping.Add(clientId, nCon);
+                                this.pollKeyCacheDirty = true;
                             }
                             else
                             {
@@ -194,6 +202,7 @@ namespace Netcode.Transports
                         };
 
                         this.connectionMapping.Add(clientId, nCon);
+                        this.pollKeyCacheDirty = true;
                     }
                     else
                         value.connection = param.m_hConn;
@@ -224,29 +233,55 @@ namespace Netcode.Transports
 
             #endregion
 
-            foreach (SteamConnectionData connectionData in this.connectionMapping.Values)
+            if (this.pollKeyCacheDirty)
             {
-                IntPtr[] ptrs = new IntPtr[1];
-                int messageCount;
+                this.pollKeyCache.Clear();
+                this.pollKeyCache.AddRange(this.connectionMapping.Keys);
+                this.pollKeyCacheDirty = false;
 
-                #if UNITY_SERVER
-                if ((messageCount = SteamGameServerNetworkingSockets.ReceiveMessagesOnConnection(connectionData.connection, ptrs, 1)) > 0)
-                    #else
-                if ((messageCount = SteamNetworkingSockets.ReceiveMessagesOnConnection(connectionData.connection, ptrs, 1)) > 0)
-                    #endif
+                if (this.pollStartIndex >= this.pollKeyCache.Count) this.pollStartIndex = 0;
+            }
+
+            int count = this.pollKeyCache.Count;
+            if (count > 0)
+            {
+                // Round-robin: start from where we left off to prevent starvation
+                for (int i = 0; i < count; i++)
                 {
-                    clientId = connectionData.id.m_SteamID;
+                    int idx = (this.pollStartIndex + i) % count;
+                    ulong key = this.pollKeyCache[idx];
 
-                    SteamNetworkingMessage_t data = Marshal.PtrToStructure<SteamNetworkingMessage_t>(ptrs[0]);
+                    if (!this.connectionMapping.TryGetValue(key, out SteamConnectionData connectionData)) continue;
 
-                    byte[] buffer = new byte[data.m_cbSize - 1];
-                    Marshal.Copy(data.m_pData, buffer, 0, data.m_cbSize - 1);
+                    IntPtr[] ptrs = new IntPtr[1];
+                    int messageCount;
 
-                    payload = new ArraySegment<byte>(buffer);
-                    SteamNetworkingMessage_t.Release(ptrs[0]);
+                    #if UNITY_SERVER
+                    if ((messageCount = SteamGameServerNetworkingSockets.ReceiveMessagesOnConnection(connectionData.connection, ptrs, 1)) > 0)
+                    #else
+                    if ((messageCount = SteamNetworkingSockets.ReceiveMessagesOnConnection(connectionData.connection, ptrs, 1)) > 0)
+                    #endif
+                    {
+                        clientId = connectionData.id.m_SteamID;
+                        SteamNetworkingMessage_t data = Marshal.PtrToStructure<SteamNetworkingMessage_t>(ptrs[0]);
 
-                    receiveTime = Time.realtimeSinceStartup;
-                    return NetworkEvent.Data;
+                        if (data.m_cbSize <= 1)
+                        {
+                            SteamNetworkingMessage_t.Release(ptrs[0]);
+                            continue;
+                        }
+
+                        byte[] buffer = new byte[data.m_cbSize - 1];
+                        Marshal.Copy(data.m_pData, buffer, 0, data.m_cbSize - 1);
+
+                        payload = new ArraySegment<byte>(buffer);
+                        SteamNetworkingMessage_t.Release(ptrs[0]);
+
+                        receiveTime = Time.realtimeSinceStartup;
+
+                        this.pollStartIndex = (idx + 1) % count;
+                        return NetworkEvent.Data;
+                    }
                 }
             }
 
@@ -370,6 +405,7 @@ namespace Netcode.Transports
                 #endif
 
                 this.connectionMapping.Add(this.ConnectToSteamID, this.client);
+                this.pollKeyCacheDirty = true;
                 return true;
             }
             catch (Exception ex)
@@ -418,6 +454,9 @@ namespace Netcode.Transports
 
             this.pendingDisconnectReasons.Clear();
             this.connectionMapping.Clear();
+            this.pollKeyCache.Clear();
+            this.pollKeyCacheDirty = true;
+            this.pollStartIndex = 0;
             this.client = null;
 
             if (NetworkManager.Singleton?.LogLevel <= LogLevel.Developer) Debug.Log(nameof(SteamNetworkingSocketsTransport) + " - CloseP2PSessions - has Closed P2P Sessions With all Users");
