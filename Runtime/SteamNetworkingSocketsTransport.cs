@@ -35,12 +35,16 @@ namespace Netcode.Transports
         private readonly Dictionary<ulong, SteamConnectionData> connectionMapping = new Dictionary<ulong, SteamConnectionData>();
         private readonly Queue<SteamNetConnectionStatusChangedCallback_t> connectionStatusChangeQueue = new Queue<SteamNetConnectionStatusChangedCallback_t>();
         private readonly Dictionary<ulong, string> pendingDisconnectReasons = new Dictionary<ulong, string>();
-        
-		private bool isServer;
+        private bool isServer;
 
         private int pollStartIndex;
         private readonly List<ulong> pollKeyCache = new List<ulong>();
         private bool pollKeyCacheDirty = true;
+
+        private const float KEEPALIVE_INTERVAL = 5f;
+
+        private readonly Dictionary<ulong, float> lastSendTime = new Dictionary<ulong, float>();
+        private readonly byte[] keepalivePayload = new byte[1];
 
         #endregion
 
@@ -86,6 +90,7 @@ namespace Netcode.Transports
                 #endif
 
                 this.connectionMapping.Remove(this.client.id.m_SteamID);
+                this.lastSendTime.Remove(this.client.id.m_SteamID);
                 this.pollKeyCacheDirty = true;
             }
 
@@ -111,6 +116,7 @@ namespace Netcode.Transports
             #endif
 
             this.connectionMapping.Remove(clientId);
+            this.lastSendTime.Remove(clientId);
             this.pollKeyCacheDirty = true;
         }
 
@@ -147,8 +153,6 @@ namespace Netcode.Transports
 
                 if (param.m_info.m_eState == ESteamNetworkingConnectionState.k_ESteamNetworkingConnectionState_Connecting)
                 {
-                    //This happens when someone asked to connect to us, in the case of NetCode for GameObject this should only happen if we are a server/host
-                    //the current standard is to blindly accept ... NetCode for GO should really consider a validation model for connections
                     if (NetworkManager.Singleton?.LogLevel <= LogLevel.Developer) NetworkLog.LogInfoServer(nameof(SteamNetworkingSocketsTransport) + " - connection request from " + param.m_info.m_identityRemote.GetSteamID64());
 
                     if (this.isServer)
@@ -233,6 +237,24 @@ namespace Netcode.Transports
 
             #endregion
 
+            float now = Time.realtimeSinceStartup;
+            foreach (SteamConnectionData connectionData in this.connectionMapping.Values)
+            {
+                ulong connId = connectionData.id.m_SteamID;
+                if (this.lastSendTime.TryGetValue(connId, out float last) && now - last < SteamNetworkingSocketsTransport.KEEPALIVE_INTERVAL) continue;
+
+                GCHandle pinned = GCHandle.Alloc(this.keepalivePayload, GCHandleType.Pinned);
+
+                #if UNITY_SERVER
+                SteamGameServerNetworkingSockets.SendMessageToConnection(connectionData.connection, pinned.AddrOfPinnedObject(), 1, Constants.k_nSteamNetworkingSend_Unreliable, out long _);
+                #else
+                SteamNetworkingSockets.SendMessageToConnection(connectionData.connection, pinned.AddrOfPinnedObject(), 1, Constants.k_nSteamNetworkingSend_Unreliable, out long _);
+                #endif
+
+                pinned.Free();
+                this.lastSendTime[connId] = now;
+            }
+
             if (this.pollKeyCacheDirty)
             {
                 this.pollKeyCache.Clear();
@@ -245,7 +267,6 @@ namespace Netcode.Transports
             int count = this.pollKeyCache.Count;
             if (count > 0)
             {
-                // Round-robin: start from where we left off to prevent starvation
                 for (int i = 0; i < count; i++)
                 {
                     int idx = (this.pollStartIndex + i) % count;
@@ -263,6 +284,7 @@ namespace Netcode.Transports
                     #endif
                     {
                         clientId = connectionData.id.m_SteamID;
+
                         SteamNetworkingMessage_t data = Marshal.PtrToStructure<SteamNetworkingMessage_t>(ptrs[0]);
 
                         if (data.m_cbSize <= 1)
@@ -279,6 +301,7 @@ namespace Netcode.Transports
 
                         receiveTime = Time.realtimeSinceStartup;
 
+                        // Advance past this connection for next PollEvent call
                         this.pollStartIndex = (idx + 1) % count;
                         return NetworkEvent.Data;
                     }
@@ -332,7 +355,6 @@ namespace Netcode.Transports
 
                 pinnedArray.Free();
 
-                //If we had some error report that and move on
                 if (response is EResult.k_EResultNoConnection or EResult.k_EResultInvalidParam)
                 {
                     Debug.LogWarning($"Connection to server was lost -> {response}");
@@ -348,8 +370,11 @@ namespace Netcode.Transports
                     SteamNetworkingSockets.CloseConnection(connection, 0, reason, false);
                     #endif
                 }
-                else if (response != EResult.k_EResultOK
-                         && NetworkManager.Singleton.LogLevel <= LogLevel.Error)
+                else if (response == EResult.k_EResultOK)
+                {
+                    this.lastSendTime[clientId] = Time.realtimeSinceStartup;
+                }
+                else if (NetworkManager.Singleton.LogLevel <= LogLevel.Error)
                     Debug.LogError($"Could not send: {response}");
             }
             else
@@ -395,6 +420,12 @@ namespace Netcode.Transports
 
             try
             {
+                #if UNITY_SERVER
+                SteamGameServerNetworkingUtils.InitRelayNetworkAccess();
+                #else
+                SteamNetworkingUtils.InitRelayNetworkAccess();
+                #endif
+
                 SteamNetworkingIdentity smi = new SteamNetworkingIdentity();
                 smi.SetSteamID(this.client.id);
 
@@ -442,7 +473,6 @@ namespace Netcode.Transports
         }
 
         private void CloseP2PSessions() {
-            // Close all connections
             foreach (SteamConnectionData user in this.connectionMapping.Values)
             {
                 #if UNITY_SERVER
@@ -457,6 +487,7 @@ namespace Netcode.Transports
             this.pollKeyCache.Clear();
             this.pollKeyCacheDirty = true;
             this.pollStartIndex = 0;
+            this.lastSendTime.Clear();
             this.client = null;
 
             if (NetworkManager.Singleton?.LogLevel <= LogLevel.Developer) Debug.Log(nameof(SteamNetworkingSocketsTransport) + " - CloseP2PSessions - has Closed P2P Sessions With all Users");
